@@ -1,4 +1,5 @@
 #include "ebyte_e32.h"
+#include <assert.h>
 #include <string.h>
 #include "driver/gpio.h"
 #include "driver/uart.h"
@@ -8,23 +9,34 @@
 
 static const char *TAG = "EBYTE_E32";
 
-#define E32_AUX_TIMEOUT_MS 800
+#define E32_AUX_MAX_SPINS (E32_AUX_TIMEOUT_MS / E32_AUX_POLL_MS)
 
 bool e32_aux_ready(void)
 {
-    return gpio_get_level(PIN_E32_AUX) != 0;
+    int level = gpio_get_level(PIN_E32_AUX);
+    assert(level == 0 || level == 1);
+    return level != 0;
 }
 
+/* No máximo E32_AUX_MAX_SPINS voltas, e nunca além de timeout_ms. */
 static bool e32_wait_aux(uint32_t timeout_ms)
 {
+    assert(timeout_ms > 0);
+    assert(timeout_ms <= E32_AUX_TIMEOUT_MS);
+    if (timeout_ms == 0 || timeout_ms > E32_AUX_TIMEOUT_MS) {
+        return false;
+    }
     TickType_t start = xTaskGetTickCount();
-    while (!e32_aux_ready()) {
+    for (int i = 0; i < E32_AUX_MAX_SPINS; i++) {
+        if (e32_aux_ready()) {
+            return true;
+        }
         if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(timeout_ms)) {
             return false;
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(E32_AUX_POLL_MS));
     }
-    return true;
+    return false;
 }
 
 static void e32_set_mode(int m0, int m1)
@@ -131,29 +143,42 @@ void e32_init(void)
 
 bool e32_send_raw(const void *data, size_t size)
 {
-    if (data == NULL || size == 0) {
+    assert(data != NULL);
+    assert(size > 0 && size <= E32_FRAME_MAX);
+    if (data == NULL || size == 0 || size > E32_FRAME_MAX) {
         return false;
     }
     if (!e32_wait_aux(E32_AUX_TIMEOUT_MS)) {
         ESP_LOGW(TAG, "AUX stuck — skip TX");
         return false;
     }
-    uart_write_bytes(E32_UART_NUM, (const char *)data, size);
-    if (uart_wait_tx_done(E32_UART_NUM, pdMS_TO_TICKS(300)) != ESP_OK) {
+    int written = uart_write_bytes(E32_UART_NUM, data, size);
+    if (written < 0 || (size_t)written != size) {
+        ESP_LOGW(TAG, "UART escreveu %d de %u", written, (unsigned)size);
         return false;
     }
-    (void)e32_wait_aux(E32_AUX_TIMEOUT_MS);
+    if (uart_wait_tx_done(E32_UART_NUM, pdMS_TO_TICKS(E32_UART_TX_TIMEOUT_MS)) != ESP_OK) {
+        return false;
+    }
+    if (!e32_wait_aux(E32_AUX_TIMEOUT_MS)) {
+        ESP_LOGW(TAG, "AUX stuck — TX incompleto");
+        return false;
+    }
+    assert(e32_aux_ready());
     return true;
 }
 
 bool e32_send_struct(void *data, size_t size)
 {
-    const uint8_t start_marker[] = {0xAA, 0xBB, 0xCC, 0xDD};
-    uint8_t frame[4 + 64];
-    if (data == NULL || size > sizeof(frame) - 4) {
+    assert(data != NULL);
+    assert(size > 0 && size <= E32_PAYLOAD_MAX);
+    if (data == NULL || size == 0 || size > E32_PAYLOAD_MAX) {
         return false;
     }
-    memcpy(frame, start_marker, 4);
-    memcpy(frame + 4, data, size);
-    return e32_send_raw(frame, 4 + size);
+    const uint8_t start_marker[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    uint8_t frame[E32_FRAME_MAX];
+    assert(sizeof(frame) == E32_FRAME_MAX);
+    memcpy(frame, start_marker, sizeof(start_marker));
+    memcpy(frame + sizeof(start_marker), data, size);
+    return e32_send_raw(frame, sizeof(start_marker) + size);
 }

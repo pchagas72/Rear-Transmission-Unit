@@ -10,6 +10,7 @@ idf_component_register(
         "http_telem.c"
         "rtu_diag.c"
         "rtu_health.c"
+        "lora_rate.c"
     INCLUDE_DIRS
         "."
         "../../../shared"
@@ -31,3 +32,5 @@ idf_component_register(
         esp_http_server
         esp_timer
 )
+
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra)

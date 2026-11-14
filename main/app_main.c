@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -6,6 +7,7 @@
 #include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
@@ -29,6 +31,7 @@
 #include "rtu_diag.h"
 #include "rtu_health.h"
 #include "rtu_fw.h"
+#include "lora_rate.h"
 
 static const char *TAG = "RTU";
 
@@ -39,14 +42,27 @@ static rtu_runtime_t rt;
 
 static void queue_command_ack_ex(uint16_t flag, uint8_t soc)
 {
-    xSemaphoreTake(q.ack_mutex, portMAX_DELAY);
+    if (q.ack_mutex == NULL || q.tx_trigger == NULL) {
+        return;
+    }
+    if (xSemaphoreTake(q.ack_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
     rt.pending_ack_flags |= flag;
     if (soc != 0) {
         rt.pending_soc_ack = soc;
     }
     rt.pending_ack_ttl = 3;
-    xSemaphoreGive(q.ack_mutex);
-    xSemaphoreGive(q.tx_trigger);
+    assert(rt.pending_ack_ttl == 3);
+    BaseType_t gave = xSemaphoreGive(q.ack_mutex);
+    assert(gave == pdTRUE);
+    if (gave != pdTRUE) {
+        return;
+    }
+    /* Binário: pdFALSE quer dizer que a task de TX já está acordada. */
+    BaseType_t kicked = xSemaphoreGive(q.tx_trigger);
+    assert(kicked == pdTRUE || kicked == pdFALSE);
+    (void)kicked;
 }
 
 static void queue_command_ack(uint16_t flag)
@@ -126,80 +142,153 @@ static void can_svc_task(void *arg)
     }
 }
 
-#define LORA_TX_PERIOD_MS 1000  /* SoftAP ~20 ms; LoRa 1 Hz — QoS ar */
+/* Um ciclo = espera do período + silêncio + duas esperas de AUX + UART. */
+#define LORA_TX_QUIET_SPINS    25
+#define LORA_TX_QUIET_SLICE_MS 10
+#define LORA_TX_QUIET_MS       150
+#define LORA_TX_CYCLE_SLACK_MS 1000
+#define LORA_TX_CYCLE_MAX_MS \
+    (LORA_RATE_MAX_MS \
+     + (LORA_TX_QUIET_SPINS * LORA_TX_QUIET_SLICE_MS) \
+     + (2u * E32_AUX_TIMEOUT_MS) \
+     + E32_UART_TX_TIMEOUT_MS \
+     + LORA_TX_CYCLE_SLACK_MS)
+
+static void lora_tx_wait_period(uint32_t period_ms)
+{
+    assert(q.tx_trigger != NULL);
+    assert(period_ms >= LORA_RATE_MIN_MS && period_ms <= LORA_RATE_MAX_MS);
+    if (q.tx_trigger == NULL) {
+        return;
+    }
+    BaseType_t kicked = xSemaphoreTake(q.tx_trigger, pdMS_TO_TICKS(period_ms));
+    assert(kicked == pdTRUE || kicked == pdFALSE);
+    (void)kicked;
+}
+
+static void lora_tx_wait_quiet(void)
+{
+    assert(LORA_TX_QUIET_SPINS > 0);
+    assert(LORA_TX_QUIET_SPINS <= 25);
+    for (int i = 0; i < LORA_TX_QUIET_SPINS; i++) {
+        TickType_t quiet = xTaskGetTickCount() - rt.e32_last_rx_tick;
+        size_t pending_rx = 0;
+        esp_err_t err = uart_get_buffered_data_len(E32_UART_NUM, &pending_rx);
+        if (err != ESP_OK) {
+            return;
+        }
+        if (pending_rx == 0 && quiet >= pdMS_TO_TICKS(LORA_TX_QUIET_MS)) {
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(LORA_TX_QUIET_SLICE_MS));
+    }
+}
+
+static bool lora_tx_read_ack(uint16_t *flags, uint8_t *soc)
+{
+    assert(flags != NULL);
+    assert(soc != NULL);
+    if (flags == NULL || soc == NULL) {
+        return false;
+    }
+    *flags = 0;
+    *soc = 0;
+    if (q.ack_mutex == NULL || xSemaphoreTake(q.ack_mutex, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    if (rt.pending_ack_ttl > 0) {
+        *flags = rt.pending_ack_flags;
+        *soc = rt.pending_soc_ack;
+    }
+    BaseType_t gave = xSemaphoreGive(q.ack_mutex);
+    assert(gave == pdTRUE);
+    return gave == pdTRUE;
+}
+
+static void lora_tx_ack_sent(void)
+{
+    if (q.ack_mutex == NULL || xSemaphoreTake(q.ack_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    if (rt.pending_ack_ttl > 0) {
+        rt.pending_ack_ttl--;
+        if (rt.pending_ack_ttl == 0) {
+            rt.pending_ack_flags = 0;
+            rt.pending_soc_ack = 0;
+        }
+    }
+    assert(rt.pending_ack_ttl <= 3);
+    BaseType_t gave = xSemaphoreGive(q.ack_mutex);
+    assert(gave == pdTRUE);
+}
+
+static bool lora_tx_emit(telemetry_packet_t *pkt)
+{
+    assert(pkt != NULL);
+    assert(sizeof(*pkt) == 52);
+    if (pkt == NULL || sizeof(*pkt) != 52) {
+        return false;
+    }
+    uint16_t ack_flags = 0;
+    uint8_t ack_soc = 0;
+    if (!lora_tx_read_ack(&ack_flags, &ack_soc)) {
+        return false;
+    }
+    pkt->flags |= ack_flags;
+    if (ack_soc != 0) {
+        pkt->soc = ack_soc;
+    } else if (can_pilot_box_latched()) {
+        pkt->soc = TELEM_SOC_PILOT_BOX;
+    }
+    pkt->seq = rt.lora_seq++;
+    pkt->ber = 0;
+    pkt->per = 0;
+    pkt->crc8 = telemetry_crc8(pkt);
+    if (!e32_send_struct(pkt, sizeof(*pkt))) {
+        rtu_health_note_lora(false);
+        ESP_LOGW(TAG, "lora_tx FAIL seq=%u AUX=%d",
+                 (unsigned)pkt->seq, (int)e32_aux_ready());
+        return false;
+    }
+    rtu_health_note_lora(true);
+    lora_rate_note_tx();
+    lora_tx_ack_sent();
+    return true;
+}
 
 static void lora_tx_task(void *arg)
 {
     (void)arg;
     telemetry_packet_t tx_copy;
-    ESP_LOGI(TAG, "lora_tx on core %d period=%dms", xPortGetCoreID(), LORA_TX_PERIOD_MS);
+    uint32_t logged_ms = 0;
+    uint32_t tx_ok = 0;
+    ESP_LOGI(TAG, "lora_tx on core %d ciclo<=%ums", xPortGetCoreID(), LORA_TX_CYCLE_MAX_MS);
 
+    /* Único laço sem fim: cada volta cabe em LORA_TX_CYCLE_MAX_MS. */
     while (1) {
-        /* ACK imediato se cmd pediu; senão cadência 1 Hz. */
-        (void)xSemaphoreTake(q.tx_trigger, pdMS_TO_TICKS(LORA_TX_PERIOD_MS));
-
-        if (!fsm_is_running() && fsm_state() != FSM_SELF_CHECK) {
-            continue;
+        TickType_t cycle_start = xTaskGetTickCount();
+        uint32_t period_ms = lora_rate_ms();
+        if (period_ms != logged_ms) {
+            ESP_LOGI(TAG, "lora_tx period=%lums", (unsigned long)period_ms);
+            logged_ms = period_ms;
         }
+        lora_tx_wait_period(period_ms);
 
-        /* Prioridade RX: quiet time após comando (AUX). */
-        for (int i = 0; i < 25; i++) {
-            TickType_t quiet = xTaskGetTickCount() - rt.e32_last_rx_tick;
-            size_t pending_rx = 0;
-            (void)uart_get_buffered_data_len(E32_UART_NUM, &pending_rx);
-            if (pending_rx == 0 && quiet >= pdMS_TO_TICKS(150)) {
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-
-        if (xQueuePeek(q.telemetry, &tx_copy, 0) != pdTRUE) {
-            continue;
-        }
-
-        uint16_t ack_flags = 0;
-        uint8_t ack_soc = 0;
-        xSemaphoreTake(q.ack_mutex, portMAX_DELAY);
-        if (rt.pending_ack_ttl > 0) {
-            ack_flags = rt.pending_ack_flags;
-            ack_soc = rt.pending_soc_ack;
-        }
-        xSemaphoreGive(q.ack_mutex);
-
-        tx_copy.flags |= ack_flags;
-        if (ack_soc != 0) {
-            tx_copy.soc = ack_soc;
-        } else if (can_pilot_box_latched()) {
-            tx_copy.soc = TELEM_SOC_PILOT_BOX;
-        }
-        tx_copy.seq = rt.lora_seq++;
-        tx_copy.ber = 0;
-        tx_copy.per = 0;
-        tx_copy.crc8 = telemetry_crc8(&tx_copy);
-
-        if (e32_send_struct(&tx_copy, sizeof(tx_copy))) {
-            rtu_health_note_lora(true);
-            static uint32_t tx_ok;
-            tx_ok++;
-            if ((tx_ok % 8u) == 1u) {
-                ESP_LOGI(TAG, "lora_tx ok seq=%u n=%lu AUX=%d",
-                         (unsigned)tx_copy.seq, (unsigned long)tx_ok,
-                         (int)e32_aux_ready());
-            }
-            xSemaphoreTake(q.ack_mutex, portMAX_DELAY);
-            if (rt.pending_ack_ttl > 0) {
-                rt.pending_ack_ttl--;
-                if (rt.pending_ack_ttl == 0) {
-                    rt.pending_ack_flags = 0;
-                    rt.pending_soc_ack = 0;
+        bool running = fsm_is_running() || fsm_state() == FSM_SELF_CHECK;
+        if (running) {
+            lora_tx_wait_quiet();
+            if (xQueuePeek(q.telemetry, &tx_copy, 0) == pdTRUE && lora_tx_emit(&tx_copy)) {
+                tx_ok++;
+                if ((tx_ok % 8u) == 1u) {
+                    ESP_LOGI(TAG, "lora_tx ok seq=%u n=%lu AUX=%d",
+                             (unsigned)tx_copy.seq, (unsigned long)tx_ok,
+                             (int)e32_aux_ready());
                 }
             }
-            xSemaphoreGive(q.ack_mutex);
-        } else {
-            rtu_health_note_lora(false);
-            ESP_LOGW(TAG, "lora_tx FAIL seq=%u AUX=%d",
-                     (unsigned)tx_copy.seq, (int)e32_aux_ready());
         }
+
+        TickType_t elapsed = xTaskGetTickCount() - cycle_start;
+        assert(elapsed <= pdMS_TO_TICKS(LORA_TX_CYCLE_MAX_MS));
     }
 }
 
@@ -410,6 +499,7 @@ void app_main(void)
         ESP_LOGE(TAG, "WiFi SoftAP falhou");
     } else {
         rtu_health_init(); /* NVS boot/reset após nvs_flash do SoftAP */
+        lora_rate_init();
         if (http_telem_start(http_ascii_cmd) != ESP_OK) {
             ESP_LOGE(TAG, "HTTP UI falhou");
         }
@@ -424,6 +514,7 @@ void app_main(void)
     q.sd = xQueueCreate(SD_QUEUE_SIZE, sizeof(SD_Storage_Packet));
     q.tx_trigger = xSemaphoreCreateBinary();
     q.ack_mutex = xSemaphoreCreateMutex();
+    lora_rate_bind_kick(q.tx_trigger);
 
     if (q.telemetry == NULL || q.sd == NULL || q.tx_trigger == NULL || q.ack_mutex == NULL) {
         ESP_LOGE(TAG, "queue/mutex alloc failed — restart");

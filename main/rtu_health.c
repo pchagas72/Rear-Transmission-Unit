@@ -1,5 +1,6 @@
 #include "rtu_health.h"
 #include "rtu_fw.h"
+#include "lora_rate.h"
 #include "system_fsm.h"
 #include "sd_log.h"
 #include "ebyte_e32.h"
@@ -109,7 +110,8 @@ int rtu_health_json(char *buf, size_t cap)
                      "\"rst\":\"%s\",\"rst_n\":%d,"
                      "\"sd\":%s,\"sd_path\":\"%s\","
                      "\"e32_aux\":%s,\"limp\":%s,\"fsm\":%d,"
-                     "\"lora_ok\":%lu,\"lora_fail\":%lu,\"can_rx\":%lu}",
+                     "\"lora_ok\":%lu,\"lora_fail\":%lu,\"can_rx\":%lu,"
+                     "\"lora_ms\":%lu,\"lora_gap_ms\":%lu}",
                      RTU_FW_VER, RTU_FW_SCHEMA,
                      (unsigned long)h.uptime_ms,
                      (unsigned long)h.heap_free, (unsigned long)h.heap_min,
@@ -119,7 +121,9 @@ int rtu_health_json(char *buf, size_t cap)
                      h.e32_aux ? "true" : "false",
                      h.limp ? "true" : "false", h.fsm,
                      (unsigned long)h.lora_tx_ok, (unsigned long)h.lora_tx_fail,
-                     (unsigned long)h.can_rx);
+                     (unsigned long)h.can_rx,
+                     (unsigned long)lora_rate_ms(),
+                     (unsigned long)lora_rate_gap_ms());
     if (n < 0 || (size_t)n >= cap) {
         return 0;
     }
