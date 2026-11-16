@@ -107,7 +107,7 @@ int rtu_health_json(char *buf, size_t cap)
                      "{\"fw\":\"%s\",\"schema\":%d,\"uptime_ms\":%lu,"
                      "\"heap\":%lu,\"heap_min\":%lu,\"boot\":%lu,"
                      "\"rst\":\"%s\",\"rst_n\":%d,"
-                     "\"sd\":%s,\"sd_path\":\"%s\","
+                     "\"sd\":%s,\"sd_busy\":%s,\"sd_path\":\"%s\","
                      "\"e32_aux\":%s,\"limp\":%s,\"fsm\":%d,"
                      "\"lora_ok\":%lu,\"lora_fail\":%lu,\"can_rx\":%lu}",
                      RTU_FW_VER, RTU_FW_SCHEMA,
@@ -115,7 +115,8 @@ int rtu_health_json(char *buf, size_t cap)
                      (unsigned long)h.heap_free, (unsigned long)h.heap_min,
                      (unsigned long)h.boot_count,
                      rst_str(h.reset_reason), h.reset_reason,
-                     h.sd_ok ? "true" : "false", h.sd_path,
+                     h.sd_ok ? "true" : "false",
+                     sd_log_busy() ? "true" : "false", h.sd_path,
                      h.e32_aux ? "true" : "false",
                      h.limp ? "true" : "false", h.fsm,
                      (unsigned long)h.lora_tx_ok, (unsigned long)h.lora_tx_fail,

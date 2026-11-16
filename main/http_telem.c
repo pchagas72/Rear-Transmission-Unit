@@ -1,12 +1,16 @@
 #include "http_telem.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "can_mgmt.h"
 #include "telem_store.h"
 #include "wifi_ap.h"
+#include "rtu_cfg.h"
 #include "rtu_diag.h"
 #include "rtu_health.h"
 #include "rtu_fw.h"
@@ -74,6 +78,21 @@ static const char INDEX_HTML[] =
 ".sna{color:var(--bad)!important;font-size:1.1rem!important}"
 ".gloss{font-size:.68rem;color:var(--mut);line-height:1.45;columns:2;column-gap:.85rem}"
 ".gloss b{color:var(--fg);font-weight:600}"
+".tok{display:flex;gap:.35rem;flex-wrap:wrap;align-items:center}"
+".tok input{flex:1;min-width:8rem;background:#1a222c;border:1px solid var(--line);"
+"border-radius:8px;color:var(--fg);padding:.4rem .55rem;font:inherit}"
+".tok button{border:1px solid var(--line);background:#1a222c;color:var(--fg);"
+"border-radius:8px;padding:.4rem .7rem;font:600 .72rem inherit}"
+".sdact{display:flex;flex-wrap:wrap;gap:.35rem;margin-bottom:.45rem}"
+".sdact button{border:1px solid var(--line);background:#1a222c;color:var(--fg);"
+"border-radius:8px;padding:.4rem .7rem;font:600 .72rem inherit}"
+".sdact .bad{border-color:var(--bad);color:var(--bad)}"
+".sdrow{display:flex;align-items:center;justify-content:space-between;gap:.5rem;"
+"padding:.2rem 0;border-bottom:1px solid var(--line)}"
+".sdrow a{color:var(--acc);text-decoration:none;font-weight:600}"
+".sdrow .sz{color:var(--mut);font-size:.7rem;margin-left:.35rem}"
+".sdrow .era{color:var(--bad);background:0;border:0;padding:0;font:600 .72rem inherit;"
+"cursor:pointer;text-decoration:underline}"
 "</style></head><body>"
 "<header class=top>"
 "<div class=brand>MANGUE<small>RTU · " WIFI_AP_SSID "</small></div>"
@@ -111,6 +130,11 @@ static const char INDEX_HTML[] =
 "<div class=sec>CAN</div><div class=g><div class=meta id=can>—</div></div>"
 "</section>"
 "<section class=view id=vDiag>"
+"<div class=sec>API token</div>"
+"<div class=g><div class=tok>"
+"<input id=tok type=password autocomplete=off placeholder=\"token (cmd/SD/cfg)\">"
+"<button type=button id=bTok>Salvar</button>"
+"</div><div class=meta id=dCfg style=margin-top:.4rem>—</div></div>"
 "<div class=sec>Health</div>"
 "<div class=chips id=dHp></div>"
 "<div class=g><div class=meta id=dHealth>—</div></div>"
@@ -122,7 +146,12 @@ static const char INDEX_HTML[] =
 "<thead><tr><th>CH</th><th>DTC</th><th>QF</th><th>miss</th><th>hit</th><th>last_ms</th></tr></thead>"
 "<tbody id=dTb></tbody></table></div>"
 "<div class=sec>SD logs</div>"
-"<div class=g><div class=meta id=dSd>…</div></div>"
+"<div class=g>"
+"<div class=sdact>"
+"<button type=button id=bSdDl>Download all</button>"
+"<button type=button id=bSdEr class=bad>Erase all</button>"
+"</div>"
+"<div class=meta id=dSd>…</div></div>"
 "<div class=sec>Telemetria (snapshot)</div>"
 "<div class=g><div class=meta id=dTelem>—</div></div>"
 "<div class=sec>Siglas</div>"
@@ -160,7 +189,13 @@ static const char INDEX_HTML[] =
 "const CS={0:'STOPPED',1:'RUNNING',2:'BUS_OFF',3:'RECOVERING'};"
 "const FS={0:'BOOT',1:'SELF',2:'RUN',3:'ERR',4:'DOWN'};"
 "const F_LED=1<<15;"
+"const TK='rtu_api_token';"
 "let page='dat';"
+"function getTok(){return localStorage.getItem(TK)||'';}"
+"function setTok(v){localStorage.setItem(TK,v||'');$('tok').value=v||'';}"
+"$('tok').value=getTok()||'manguebaja';"
+"$('bTok').onclick=()=>{setTok($('tok').value.trim());$('st').textContent='token salvo';};"
+"function authH(){const t=getTok()||$('tok').value.trim();return t?{'X-RTU-Token':t}:{};}"
 "function show(p){page=p;$('vDat').className='view'+(p==='dat'?' on':'');"
 "$('vDiag').className='view'+(p==='diag'?' on':'');"
 "$('bDat').className=p==='dat'?'on':'';$('bDiag').className=p==='diag'?'on':'';"
@@ -178,13 +213,62 @@ static const char INDEX_HTML[] =
 " el.className='n';el.textContent=en.toFixed(1);"
 " bar('be',(en/120)*100,en>100?'hot':en>85?'warn':'');return false;}"
 "function fmtB(n){n=+n||0;return n>1048576?(n/1048576).toFixed(1)+'M':n>1024?(n/1024).toFixed(0)+'K':n+'B'}"
+"function tokQ(){return encodeURIComponent(getTok()||$('tok').value.trim())}"
+"let sdBusy=false;"
+"function setSdBusy(on,msg){sdBusy=!!on;['bSdDl','bSdEr'].forEach(id=>{const e=$(id);if(e)e.disabled=!!on;});"
+" if(msg){$('st').textContent=msg;$('st').style.color=on?'var(--warn)':'var(--ok)';}}"
+"async function dlOne(name){"
+" const r=await fetch('/api/sd/get?name='+encodeURIComponent(name)+'&token='+tokQ(),{cache:'no-store'});"
+" if(!r.ok)throw new Error('HTTP '+r.status);"
+" const b=await r.blob();const u=URL.createObjectURL(b);"
+" const a=document.createElement('a');a.href=u;a.download=name;document.body.appendChild(a);a.click();a.remove();"
+" setTimeout(()=>URL.revokeObjectURL(u),2e3);}"
 "async function loadSd(){"
+" if(sdBusy)return;"
 " try{const r=await fetch('/api/sd',{cache:'no-store'});if(!r.ok)throw 0;const a=await r.json();"
 "  if(!a.length){$('dSd').textContent='sem LOG*.BIN (ou SD off)';return}"
-"  $('dSd').innerHTML=a.map(f=>'<div><a style=color:var(--acc) href=\"/api/sd/get?name='+"
-"   encodeURIComponent(f.name)+'\">'+f.name+'</a> · '+fmtB(f.size)+'</div>').join('');"
+"  const t=tokQ();"
+"  $('dSd').innerHTML=a.map(f=>'<div class=sdrow><span><a href=\"#\" data-dl=\"'+f.name+'\">'+f.name+"
+"   '</a><span class=sz>'+fmtB(f.size)+'</span></span>'+"
+"   '<button type=button class=era data-era=\"'+f.name+'\">apagar</button></div>').join('');"
+"  $('dSd').querySelectorAll('[data-dl]').forEach(a=>a.onclick=async e=>{"
+"   e.preventDefault();if(sdBusy)return;"
+"   setSdBusy(true,'BOX · baixando '+a.dataset.dl+' (LoRa/SD log pausados)');"
+"   try{await dlOne(a.dataset.dl);$('st').textContent='ok '+a.dataset.dl;}catch(err){$('st').textContent='falha download';}"
+"   finally{setSdBusy(false);}});"
+"  $('dSd').querySelectorAll('[data-era]').forEach(b=>b.onclick=()=>eraseOne(b.dataset.era));"
 " }catch(e){$('dSd').textContent='SD indisponível'}}"
+"async function eraseOne(name){"
+" if(sdBusy||!confirm('Apagar '+name+'?'))return;"
+" setSdBusy(true,'BOX · apagando '+name+'…');"
+" try{const r=await fetch('/api/sd/erase?name='+encodeURIComponent(name)+'&token='+tokQ(),"
+"  {method:'POST',headers:authH()});"
+"  const t=await r.text();$('st').textContent='erase '+name+' → '+(r.ok?'ok':t.slice(0,48));"
+" }finally{setSdBusy(false);loadSd();}}"
+"$('bSdDl').onclick=async()=>{"
+" if(sdBusy)return;"
+" try{const r=await fetch('/api/sd',{cache:'no-store'});if(!r.ok)throw 0;const a=await r.json();"
+"  if(!a.length){$('st').textContent='SD vazio';return}"
+"  setSdBusy(true,'BOX · download 0/'+a.length+' (LoRa/SD pausados)');"
+"  for(let i=0;i<a.length;i++){"
+"   setSdBusy(true,'BOX · download '+(i+1)+'/'+a.length+' · '+a[i].name);"
+"   await dlOne(a[i].name);}"
+"  $('st').textContent='download all ok ('+a.length+')';"
+" }catch(e){$('st').textContent='download all falhou'}finally{setSdBusy(false);loadSd();}};"
+"$('bSdEr').onclick=async()=>{"
+" if(sdBusy||!confirm('Apagar TODOS os LOG*.BIN do SD?'))return;"
+" setSdBusy(true,'BOX · erase all (LoRa/SD pausados)…');"
+" try{const r=await fetch('/api/sd/erase_all?token='+tokQ(),{method:'POST',headers:authH()});"
+"  const j=await r.json().catch(()=>({}));"
+"  $('st').textContent=r.ok?('erase all · '+((j&&j.n!=null)?j.n:'?')+' file(s)'):('erase all falhou');"
+" }finally{setSdBusy(false);loadSd();}};"
+"async function loadCfg(){"
+" try{const r=await fetch('/api/cfg',{cache:'no-store'});if(!r.ok)throw 0;const c=await r.json();"
+"  $('dCfg').textContent='SSID '+c.ssid+' · token_len '+c.token_len+' · lora_ch 0x'+c.lora_ch.toString(16)"
+"   +' · ap_pass_len '+c.ap_pass_len;"
+" }catch(e){$('dCfg').textContent='cfg indisponível'}}"
 "async function tick(){"
+" if(sdBusy)return;"
 " try{"
 "  const [rj,rd,rh]=await Promise.all(["
 "   fetch('/api/json',{cache:'no-store'}),"
@@ -219,8 +303,9 @@ static const char INDEX_HTML[] =
 "  if(h){"
 "   $('dHp').innerHTML=chip('fw '+h.fw,'neu')+chip('boot '+h.boot,'neu')"
 "    +chip('rst '+h.rst,(h.rst==='BROWNOUT'||h.rst.indexOf('WDT')>=0||h.rst==='PANIC')?'off':'on')"
-"    +chip('SD',h.sd?'on':'off')+chip('E32',h.e32_aux?'on':'off')"
-"    +chip('LoRa '+h.lora_ok+'/'+h.lora_fail,h.lora_fail>0&&h.lora_ok===0?'off':'on');"
+"    +chip('SD',h.sd_busy?'warn':(h.sd?'on':'off'))+chip('E32',h.e32_aux?'on':'off')"
+"    +chip('LoRa '+h.lora_ok+'/'+h.lora_fail,h.lora_fail>0&&h.lora_ok===0?'off':'on')"
+"    +(h.sd_busy?chip('BOX/SD','warn'):'');"
 "   $('dHealth').textContent='up '+(h.uptime_ms/1000).toFixed(0)+'s · heap '+fmtB(h.heap)"
 "    +' (min '+fmtB(h.heap_min)+') · can_rx '+h.can_rx"
 "    +(h.sd_path?' · '+h.sd_path:'');"
@@ -250,10 +335,11 @@ static const char INDEX_HTML[] =
 "  }"
 " }catch(e){$('st').textContent='ERRO';$('st').style.color='var(--bad)';$('dot').className='dot'}"
 "}"
-"setInterval(tick,500);tick();loadSd();setInterval(loadSd,5000);"
+"setInterval(tick,500);tick();loadSd();loadCfg();setInterval(loadSd,5000);"
 "document.querySelectorAll('[data-c]').forEach(b=>b.onclick=async()=>{"
-" const r=await fetch('/api/cmd',{method:'POST',headers:{'Content-Type':'text/plain'},body:b.dataset.c});"
-" const t=await r.text();$('st').textContent=b.dataset.c+' → '+t.slice(0,48);"
+" const r=await fetch('/api/cmd',{method:'POST',headers:Object.assign({'Content-Type':'text/plain'},authH()),"
+"  body:b.dataset.c});"
+" const t=await r.text();$('st').textContent=(r.status===401?'401 ':'')+b.dataset.c+' → '+t.slice(0,48);"
 "});"
 "</script></body></html>";
 
@@ -356,9 +442,155 @@ static esp_err_t send_sd_list(httpd_req_t *req)
     return httpd_resp_send(req, buf, n);
 }
 
+static bool extract_token(httpd_req_t *req, char *out, size_t out_sz)
+{
+    if (out == NULL || out_sz == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    size_t hdr_len = httpd_req_get_hdr_value_len(req, "X-RTU-Token");
+    if (hdr_len > 0 && hdr_len < out_sz) {
+        if (httpd_req_get_hdr_value_str(req, "X-RTU-Token", out, out_sz) == ESP_OK) {
+            return out[0] != '\0';
+        }
+    }
+
+    hdr_len = httpd_req_get_hdr_value_len(req, "Authorization");
+    if (hdr_len > 0 && hdr_len < 96) {
+        char auth[96];
+        if (httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth)) == ESP_OK) {
+            const char *p = auth;
+            if ((p[0] == 'B' || p[0] == 'b') &&
+                (p[1] == 'e' || p[1] == 'E') &&
+                (p[2] == 'a' || p[2] == 'A') &&
+                (p[3] == 'r' || p[3] == 'R') &&
+                (p[4] == 'e' || p[4] == 'E') &&
+                (p[5] == 'r' || p[5] == 'R') &&
+                p[6] == ' ') {
+                p += 7;
+            }
+            while (*p == ' ') {
+                p++;
+            }
+            strncpy(out, p, out_sz - 1);
+            out[out_sz - 1] = '\0';
+            if (out[0]) {
+                return true;
+            }
+        }
+    }
+
+    char q[128];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        if (httpd_query_key_value(q, "token", out, out_sz) == ESP_OK && out[0]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static esp_err_t require_token(httpd_req_t *req)
+{
+    char tok[RTU_CFG_TOKEN_MAX];
+    if (!extract_token(req, tok, sizeof(tok)) || !rtu_cfg_token_ok(tok)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        (void)httpd_resp_send(req, "{\"ok\":false,\"err\":\"unauthorized\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_ERR_NOT_ALLOWED;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t send_cfg(httpd_req_t *req)
+{
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":true,\"ssid\":\"%s\",\"ap_pass_len\":%u,\"token_len\":%u,\"lora_ch\":%u}",
+             WIFI_AP_SSID,
+             (unsigned)strlen(rtu_cfg_ap_pass()),
+             (unsigned)strlen(rtu_cfg_api_token()),
+             (unsigned)rtu_cfg_lora_chan());
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t post_cfg(httpd_req_t *req)
+{
+    esp_err_t auth = require_token(req);
+    if (auth != ESP_OK) {
+        return auth;
+    }
+
+    char body[160];
+    int total = req->content_len;
+    if (total <= 0 || total >= (int)sizeof(body)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "{\"ok\":false,\"err\":\"bad len\"}", HTTPD_RESP_USE_STRLEN);
+    }
+    int n = httpd_req_recv(req, body, total);
+    if (n <= 0) {
+        return ESP_FAIL;
+    }
+    body[n] = '\0';
+
+    char ap_pass[RTU_CFG_PASS_MAX] = { 0 };
+    char token[RTU_CFG_TOKEN_MAX] = { 0 };
+    int lora = -1;
+    char *p = body;
+    while (p && *p) {
+        char *eq = strchr(p, '=');
+        char *amp = strchr(p, '&');
+        if (eq == NULL) {
+            break;
+        }
+        *eq = '\0';
+        char *val = eq + 1;
+        if (amp) {
+            *amp = '\0';
+        }
+        if (strcmp(p, "ap_pass") == 0) {
+            strncpy(ap_pass, val, sizeof(ap_pass) - 1);
+        } else if (strcmp(p, "token") == 0) {
+            strncpy(token, val, sizeof(token) - 1);
+        } else if (strcmp(p, "lora_ch") == 0) {
+            lora = (int)strtol(val, NULL, 0);
+        }
+        p = amp ? amp + 1 : NULL;
+    }
+
+    esp_err_t err = rtu_cfg_set(ap_pass[0] ? ap_pass : NULL,
+                                token[0] ? token : NULL,
+                                lora);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "{\"ok\":false,\"err\":\"invalid\"}", HTTPD_RESP_USE_STRLEN);
+    }
+    return httpd_resp_send(req,
+                           "{\"ok\":true,\"note\":\"ap_pass aplica no próximo boot\"}",
+                           HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t send_sd_get(httpd_req_t *req)
 {
-    char q[64];
+    esp_err_t auth = require_token(req);
+    if (auth != ESP_OK) {
+        return auth;
+    }
+
+    if (sd_log_busy()) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, "{\"ok\":false,\"err\":\"sd busy\"}",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    char q[128];
     char name[24];
     name[0] = '\0';
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
@@ -366,28 +598,103 @@ static esp_err_t send_sd_get(httpd_req_t *req)
             name[0] = '\0';
         }
     }
+
+    /* Box: pausa log SD + LoRa — SPI exclusivo para o transfer. */
+    sd_log_busy_enter("download");
     uint32_t sz = 0;
     FILE *f = sd_log_open_read(name, &sz);
     if (f == NULL) {
+        sd_log_busy_exit();
         httpd_resp_set_status(req, "404 Not Found");
         return httpd_resp_send(req, "not found", HTTPD_RESP_USE_STRLEN);
     }
+
     httpd_resp_set_type(req, "application/octet-stream");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
     char cd[48];
     snprintf(cd, sizeof(cd), "attachment; filename=\"%.20s\"", name);
     httpd_resp_set_hdr(req, "Content-Disposition", cd);
 
-    char chunk[512];
+    /* Chunks grandes; yield raro só p/ WDT — resto da RTU já está pausada. */
+    char chunk[2048];
     size_t n;
+    unsigned bursts = 0;
     while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) {
         if (httpd_resp_send_chunk(req, chunk, n) != ESP_OK) {
             break;
         }
+        if ((++bursts & 31u) == 0u) {
+            vTaskDelay(1);
+        }
     }
     fclose(f);
-    return httpd_resp_send_chunk(req, NULL, 0);
+    esp_err_t err = httpd_resp_send_chunk(req, NULL, 0);
+    sd_log_busy_exit();
+    return err;
+}
+
+static esp_err_t post_sd_erase(httpd_req_t *req)
+{
+    esp_err_t auth = require_token(req);
+    if (auth != ESP_OK) {
+        return auth;
+    }
+
+    if (sd_log_busy()) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, "{\"ok\":false,\"err\":\"sd busy\"}",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    char q[128];
+    char name[24];
+    name[0] = '\0';
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        (void)httpd_query_key_value(q, "name", name, sizeof(name));
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    sd_log_busy_enter("erase");
+    bool ok = (name[0] != '\0') && sd_log_erase(name);
+    sd_log_busy_exit();
+    if (!ok) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "{\"ok\":false,\"err\":\"erase\"}", HTTPD_RESP_USE_STRLEN);
+    }
+    char resp[80];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"erased\":\"%.20s\"}", name);
+    return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t post_sd_erase_all(httpd_req_t *req)
+{
+    esp_err_t auth = require_token(req);
+    if (auth != ESP_OK) {
+        return auth;
+    }
+
+    if (sd_log_busy()) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, "{\"ok\":false,\"err\":\"sd busy\"}",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    sd_log_busy_enter("erase_all");
+    int n = sd_log_erase_all();
+    sd_log_busy_exit();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (n < 0) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_send(req, "{\"ok\":false,\"err\":\"sd\"}", HTTPD_RESP_USE_STRLEN);
+    }
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"n\":%d}", n);
+    return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t send_packet(httpd_req_t *req)
@@ -411,6 +718,11 @@ static esp_err_t send_index(httpd_req_t *req)
 
 static esp_err_t post_cmd(httpd_req_t *req)
 {
+    esp_err_t auth = require_token(req);
+    if (auth != ESP_OK) {
+        return auth;
+    }
+
     char body[64];
     int total = req->content_len;
     if (total <= 0 || total >= (int)sizeof(body)) {
@@ -442,7 +754,7 @@ static esp_err_t options_cors(httpd_req_t *req)
 {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, X-RTU-Token, Authorization");
     return httpd_resp_send(req, NULL, 0);
 }
 
@@ -452,8 +764,12 @@ esp_err_t http_telem_start(http_cmd_fn cmd_cb)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 12;
-    cfg.stack_size = 6144;
+    /* Default 7; SoftAP + poll×3 + 1 download já aperta. LRU evita accept stuck. */
+    cfg.max_open_sockets = 7;
+    cfg.max_uri_handlers = 20;
+    cfg.stack_size = 8192;
+    cfg.recv_wait_timeout = 8;
+    cfg.send_wait_timeout = 8;
 
     esp_err_t err = httpd_start(&s_server, &cfg);
     if (err != ESP_OK) {
@@ -462,19 +778,26 @@ esp_err_t http_telem_start(http_cmd_fn cmd_cb)
     }
 
     const httpd_uri_t uris[] = {
-        { .uri = "/",             .method = HTTP_GET,     .handler = send_index },
-        { .uri = "/api/json",     .method = HTTP_GET,     .handler = send_json },
-        { .uri = "/api/diag",     .method = HTTP_GET,     .handler = send_diag },
-        { .uri = "/api/health",   .method = HTTP_GET,     .handler = send_health },
-        { .uri = "/api/sd",       .method = HTTP_GET,     .handler = send_sd_list },
-        { .uri = "/api/sd/get",   .method = HTTP_GET,     .handler = send_sd_get },
-        { .uri = "/api/packet",   .method = HTTP_GET,     .handler = send_packet },
-        { .uri = "/api/cmd",      .method = HTTP_POST,    .handler = post_cmd },
-        { .uri = "/api/cmd",      .method = HTTP_OPTIONS, .handler = options_cors },
+        { .uri = "/",               .method = HTTP_GET,     .handler = send_index },
+        { .uri = "/api/json",       .method = HTTP_GET,     .handler = send_json },
+        { .uri = "/api/diag",       .method = HTTP_GET,     .handler = send_diag },
+        { .uri = "/api/health",     .method = HTTP_GET,     .handler = send_health },
+        { .uri = "/api/cfg",        .method = HTTP_GET,     .handler = send_cfg },
+        { .uri = "/api/cfg",        .method = HTTP_POST,    .handler = post_cfg },
+        { .uri = "/api/cfg",        .method = HTTP_OPTIONS, .handler = options_cors },
+        { .uri = "/api/sd",         .method = HTTP_GET,     .handler = send_sd_list },
+        { .uri = "/api/sd/get",     .method = HTTP_GET,     .handler = send_sd_get },
+        { .uri = "/api/sd/erase",   .method = HTTP_POST,    .handler = post_sd_erase },
+        { .uri = "/api/sd/erase",   .method = HTTP_OPTIONS, .handler = options_cors },
+        { .uri = "/api/sd/erase_all", .method = HTTP_POST,  .handler = post_sd_erase_all },
+        { .uri = "/api/sd/erase_all", .method = HTTP_OPTIONS, .handler = options_cors },
+        { .uri = "/api/packet",     .method = HTTP_GET,     .handler = send_packet },
+        { .uri = "/api/cmd",        .method = HTTP_POST,    .handler = post_cmd },
+        { .uri = "/api/cmd",        .method = HTTP_OPTIONS, .handler = options_cors },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(s_server, &uris[i]);
     }
-    ESP_LOGI(TAG, "UI http://192.168.4.1/  /api/json /api/diag /api/health /api/sd");
+    ESP_LOGI(TAG, "UI http://192.168.4.1/  auth on cmd/sd/cfg/erase");
     return ESP_OK;
 }

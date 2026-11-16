@@ -9,7 +9,7 @@
 #include "can_mgmt.h"
 #include "telemetry_packets.h"
 
-#define SD_QUEUE_SIZE 128
+#define SD_QUEUE_SIZE 256  /* buffer se SPI/SD atrasar (download/erase) */
 
 typedef struct {
     QueueHandle_t telemetry;

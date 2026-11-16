@@ -5,7 +5,8 @@ Este texto explica **o que esta placa faz** e **como o código está organizado*
 > **RTU** = *Rear Transmission Unit* — unidade de transmissão traseira.  
 > Ela **não** mede a maioria dos sensores do carro. Ela **recebe** dados das outras ECUs (FCU/RCU) pelo barramento **CAN**, junta tudo num pacote e **repassa** por Wi‑Fi (SoftAP), LoRa e cartão SD.
 
-Documentos irmãos (mais técnicos): `architecture.md`, `connections.md`, `relatorio_hw_connections.md`.
+Documentação técnica e roteiros de teste: pasta [`documentacao/`](documentacao/)  
+(ex.: `architecture.md`, `connections.md`, `relatorio_hw_connections.md`, `testagem_no_chicote.md`).
 
 ---
 
@@ -67,8 +68,11 @@ rtu/
 │   ├── sd_log/                ← monta SD e grava LOG####.BIN
 │   └── a7670_mqtt/            ← stub do 4G (ainda não integrado de verdade)
 ├── partitions.csv             ← quanto da flash 4 MB vai para o app
-├── guia_aspirante.md          ← este arquivo
-└── architecture.md            ← visão mais técnica
+├── README.md                  ← este arquivo (guia do aspirante)
+└── documentacao/              ← demais .md + pdfs/
+    ├── architecture.md
+    ├── testagem_no_chicote.md
+    └── pdfs/
 ```
 
 Pacote compartilhado com outras placas/estação:  
@@ -281,9 +285,10 @@ Se mudar `partitions.csv`, normalmente precisa **apagar a flash** antes (`erase-
 
 ## 12. Onde pedir ajuda
 
-- Dúvida de **pino/fiação**: `connections.md` + `board_pins.h`.
-- Dúvida de **arquitetura**: `architecture.md`.
-- Dúvida de **bancada/testes**: `testes_protoboard.md` / `relatorio_hw_connections.md`.
+- Dúvida de **pino/fiação**: `documentacao/connections.md` + `board_pins.h`.
+- Dúvida de **arquitetura**: `documentacao/architecture.md`.
+- Dúvida de **bancada/testes**: `documentacao/testes_protoboard.md` / `documentacao/relatorio_hw_connections.md`.
+- Dúvida de **chicote (galpão)**: `documentacao/testagem_no_chicote.md` (PDF em `documentacao/pdfs/`).
 - Dúvida de **siglas na UI**: aba Diag → seção Siglas.
 
 Bem-vindo(a) ao time de embutidos — a RTU parece grande, mas o fluxo é sempre o mesmo: **CAN → pacote → SoftAP / LoRa / SD**.

@@ -44,9 +44,15 @@ static void queue_command_ack_ex(uint16_t flag, uint8_t soc)
     if (soc != 0) {
         rt.pending_soc_ack = soc;
     }
-    rt.pending_ack_ttl = 3;
+    /* Box (soc): mais janelas — estação precisa ouvir 0xBB no ar. */
+    const uint8_t ttl = (soc == TELEM_SOC_ACK_BOX) ? 16u : 10u;
+    rt.pending_ack_ttl = ttl;
     xSemaphoreGive(q.ack_mutex);
-    xSemaphoreGive(q.tx_trigger);
+    xSemaphoreGive(q.tx_trigger); /* acorda lora_tx já — prioridade ACK */
+    if (soc == TELEM_SOC_ACK_BOX) {
+        ESP_LOGI(TAG, "ACK BOX queued (soc=0x%02X ttl=%u)", (unsigned)soc,
+                 (unsigned)ttl);
+    }
 }
 
 static void queue_command_ack(uint16_t flag)
@@ -98,10 +104,19 @@ static void can_svc_task(void *arg)
         xQueueOverwrite(q.telemetry, &pkt);
         telem_store_update(&pkt);
 
-        if (fsm_state() == FSM_RUNNING || fsm_state() == FSM_SELF_CHECK) {
+        if ((fsm_state() == FSM_RUNNING || fsm_state() == FSM_SELF_CHECK) &&
+            !sd_log_busy()) {
+            /* SD sempre em corrida; em box/download softAP trava o resto. */
             sd_pkt.timestamp_ms = now_ms;
             sd_pkt.telem = pkt;
-            xQueueSend(q.sd, &sd_pkt, 0);
+            if (xQueueSend(q.sd, &sd_pkt, 0) != pdTRUE) {
+                static uint32_t sd_drop;
+                sd_drop++;
+                if ((sd_drop % 50u) == 1u) {
+                    ESP_LOGW(TAG, "sd queue full — drop #%lu (SPI lento?)",
+                             (unsigned long)sd_drop);
+                }
+            }
 
             /* Rebroadcast LED só se já houve RX (evita BUS_OFF sozinho no barramento). */
             if (bus_now.rx_frames > 0) {
@@ -126,45 +141,58 @@ static void can_svc_task(void *arg)
     }
 }
 
-#define LORA_TX_PERIOD_MS 1000  /* SoftAP ~20 ms; LoRa 1 Hz — QoS ar */
+#define LORA_TX_PERIOD_MS     1000  /* telem normal 1 Hz */
+#define LORA_ACK_BURST_MS      200  /* ACK: re-TX rápido (ok “perder” telem no ar) */
 
 static void lora_tx_task(void *arg)
 {
     (void)arg;
     telemetry_packet_t tx_copy;
-    ESP_LOGI(TAG, "lora_tx on core %d period=%dms", xPortGetCoreID(), LORA_TX_PERIOD_MS);
+    ESP_LOGI(TAG, "lora_tx on core %d period=%dms ack_burst=%dms",
+             xPortGetCoreID(), LORA_TX_PERIOD_MS, LORA_ACK_BURST_MS);
 
     while (1) {
-        /* ACK imediato se cmd pediu; senão cadência 1 Hz. */
-        (void)xSemaphoreTake(q.tx_trigger, pdMS_TO_TICKS(LORA_TX_PERIOD_MS));
+        /* Cadência: 1 Hz normal; com ACK pendente, burst ~200 ms. */
+        xSemaphoreTake(q.ack_mutex, portMAX_DELAY);
+        const bool ack_wait = (rt.pending_ack_ttl > 0);
+        xSemaphoreGive(q.ack_mutex);
+        (void)xSemaphoreTake(q.tx_trigger,
+                             pdMS_TO_TICKS(ack_wait ? LORA_ACK_BURST_MS : LORA_TX_PERIOD_MS));
 
         if (!fsm_is_running() && fsm_state() != FSM_SELF_CHECK) {
             continue;
         }
+        uint16_t ack_flags = 0;
+        uint8_t ack_soc = 0;
+        xSemaphoreTake(q.ack_mutex, portMAX_DELAY);
+        const bool ack_pending = (rt.pending_ack_ttl > 0);
+        if (ack_pending) {
+            ack_flags = rt.pending_ack_flags;
+            ack_soc = rt.pending_soc_ack;
+        }
+        xSemaphoreGive(q.ack_mutex);
 
-        /* Prioridade RX: quiet time após comando (AUX). */
-        for (int i = 0; i < 25; i++) {
+        /* SoftAP download pausa telem; ACK (ex.: box 0xBB) ainda sobe no ar. */
+        if (sd_log_busy() && !ack_pending) {
+            continue;
+        }
+
+        /* Quiet após RX. ACK: quiet mínimo — prioridade no ar (estação pode dropar telem). */
+        const int quiet_need = ack_pending ? 20 : 150;
+        const int quiet_loops = ack_pending ? 4 : 25;
+        for (int i = 0; i < quiet_loops; i++) {
             TickType_t quiet = xTaskGetTickCount() - rt.e32_last_rx_tick;
             size_t pending_rx = 0;
             (void)uart_get_buffered_data_len(E32_UART_NUM, &pending_rx);
-            if (pending_rx == 0 && quiet >= pdMS_TO_TICKS(150)) {
+            if (pending_rx == 0 && quiet >= pdMS_TO_TICKS(quiet_need)) {
                 break;
             }
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(5));
         }
 
         if (xQueuePeek(q.telemetry, &tx_copy, 0) != pdTRUE) {
             continue;
         }
-
-        uint16_t ack_flags = 0;
-        uint8_t ack_soc = 0;
-        xSemaphoreTake(q.ack_mutex, portMAX_DELAY);
-        if (rt.pending_ack_ttl > 0) {
-            ack_flags = rt.pending_ack_flags;
-            ack_soc = rt.pending_soc_ack;
-        }
-        xSemaphoreGive(q.ack_mutex);
 
         tx_copy.flags |= ack_flags;
         if (ack_soc != 0) {
@@ -179,12 +207,16 @@ static void lora_tx_task(void *arg)
 
         if (e32_send_struct(&tx_copy, sizeof(tx_copy))) {
             rtu_health_note_lora(true);
+            /* SoftAP/Diag vê o mesmo snapshot que foi ao ar (incl. soc ACK box). */
+            telem_store_update(&tx_copy);
             static uint32_t tx_ok;
             tx_ok++;
-            if ((tx_ok % 8u) == 1u) {
-                ESP_LOGI(TAG, "lora_tx ok seq=%u n=%lu AUX=%d",
+            if (ack_pending || (tx_ok % 8u) == 1u) {
+                ESP_LOGI(TAG, "lora_tx ok seq=%u n=%lu AUX=%d%s%s",
                          (unsigned)tx_copy.seq, (unsigned long)tx_ok,
-                         (int)e32_aux_ready());
+                         (int)e32_aux_ready(),
+                         ack_pending ? " ACK" : "",
+                         (ack_soc == TELEM_SOC_ACK_BOX) ? " BOX" : "");
             }
             xSemaphoreTake(q.ack_mutex, portMAX_DELAY);
             if (rt.pending_ack_ttl > 0) {
@@ -197,8 +229,10 @@ static void lora_tx_task(void *arg)
             xSemaphoreGive(q.ack_mutex);
         } else {
             rtu_health_note_lora(false);
-            ESP_LOGW(TAG, "lora_tx FAIL seq=%u AUX=%d",
-                     (unsigned)tx_copy.seq, (int)e32_aux_ready());
+            ESP_LOGW(TAG, "lora_tx FAIL seq=%u AUX=%d%s",
+                     (unsigned)tx_copy.seq, (int)e32_aux_ready(),
+                     ack_pending ? " ACK" : "");
+            /* Falha: não consome TTL — re-tenta no próximo burst. */
         }
     }
 }

@@ -8,6 +8,7 @@ idf_component_register(
         "telem_store.c"
         "wifi_ap.c"
         "http_telem.c"
+        "rtu_cfg.c"
         "rtu_diag.c"
         "rtu_health.c"
     INCLUDE_DIRS

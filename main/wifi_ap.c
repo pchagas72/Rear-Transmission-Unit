@@ -1,4 +1,5 @@
 #include "wifi_ap.h"
+#include "rtu_cfg.h"
 
 #include <string.h>
 #include "esp_event.h"
@@ -32,6 +33,9 @@ esp_err_t wifi_ap_start(void)
     }
     ESP_ERROR_CHECK(err);
 
+    (void)rtu_cfg_init();
+    const char *ap_pass = rtu_cfg_ap_pass();
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_ap();
@@ -43,12 +47,12 @@ esp_err_t wifi_ap_start(void)
 
     wifi_config_t wifi_config = { 0 };
     strncpy((char *)wifi_config.ap.ssid, WIFI_AP_SSID, sizeof(wifi_config.ap.ssid) - 1);
-    strncpy((char *)wifi_config.ap.password, WIFI_AP_PASS, sizeof(wifi_config.ap.password) - 1);
+    strncpy((char *)wifi_config.ap.password, ap_pass, sizeof(wifi_config.ap.password) - 1);
     wifi_config.ap.ssid_len = (uint8_t)strlen(WIFI_AP_SSID);
     wifi_config.ap.channel = WIFI_AP_CHANNEL;
     wifi_config.ap.max_connection = 4;
     wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    if (strlen(WIFI_AP_PASS) == 0) {
+    if (strlen(ap_pass) == 0) {
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
     }
 
@@ -56,7 +60,7 @@ esp_err_t wifi_ap_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "SoftAP SSID='%s' pass='%s' → http://192.168.4.1/",
-             WIFI_AP_SSID, WIFI_AP_PASS);
+    ESP_LOGI(TAG, "SoftAP SSID='%s' pass_len=%u → http://192.168.4.1/",
+             WIFI_AP_SSID, (unsigned)strlen(ap_pass));
     return ESP_OK;
 }

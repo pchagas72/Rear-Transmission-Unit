@@ -13,6 +13,7 @@
 #include "driver/spi_master.h"
 #include "driver/sdspi_host.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "board_pins.h"
 #include "sd_log.h"
@@ -25,6 +26,41 @@ static int sync_counter = 0;
 static char log_path[32];
 static bool sd_ready;
 static bool sd_mounted;
+static SemaphoreHandle_t s_mtx;
+static volatile bool s_busy;
+static int s_busy_depth;
+
+static void sd_lock(void)
+{
+    if (s_mtx) {
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+    }
+}
+
+static void sd_unlock(void)
+{
+    if (s_mtx) {
+        xSemaphoreGive(s_mtx);
+    }
+}
+
+static const char *path_basename(const char *path)
+{
+    const char *s = strrchr(path, '/');
+    return s ? (s + 1) : path;
+}
+
+static void close_active_unlocked(void)
+{
+    if (log_file != NULL) {
+        fflush(log_file);
+        fsync(fileno(log_file));
+        fclose(log_file);
+        log_file = NULL;
+    }
+    sd_ready = false;
+    sync_counter = 0;
+}
 
 bool sd_log_ready(void)
 {
@@ -98,11 +134,45 @@ const char *sd_log_current_path(void)
 
 void sd_log_flush(void)
 {
+    sd_lock();
     if (log_file != NULL) {
         fflush(log_file);
         fsync(fileno(log_file));
         sync_counter = 0;
     }
+    sd_unlock();
+}
+
+bool sd_log_busy(void)
+{
+    return s_busy;
+}
+
+void sd_log_busy_enter(const char *why)
+{
+    sd_lock();
+    s_busy_depth++;
+    s_busy = true;
+    if (log_file != NULL) {
+        fflush(log_file);
+        fsync(fileno(log_file));
+        sync_counter = 0;
+    }
+    sd_unlock();
+    ESP_LOGI(TAG, "busy ENTER depth=%d (%s)", s_busy_depth, why ? why : "?");
+}
+
+void sd_log_busy_exit(void)
+{
+    sd_lock();
+    if (s_busy_depth > 0) {
+        s_busy_depth--;
+    }
+    if (s_busy_depth == 0) {
+        s_busy = false;
+    }
+    sd_unlock();
+    ESP_LOGI(TAG, "busy EXIT depth=%d", s_busy_depth);
 }
 
 static bool name_is_log_bin(const char *name)
@@ -142,14 +212,17 @@ int sd_log_list_json(char *buf, size_t cap)
     if (!sd_mounted) {
         return snprintf(buf, cap, "[]");
     }
+    sd_lock();
     DIR *dir = opendir(MOUNT_POINT);
     if (dir == NULL) {
+        sd_unlock();
         return snprintf(buf, cap, "[]");
     }
     int n = 0;
     int w = snprintf(buf + n, cap - (size_t)n, "[");
     if (w < 0) {
         closedir(dir);
+        sd_unlock();
         return 0;
     }
     n += w;
@@ -179,6 +252,7 @@ int sd_log_list_json(char *buf, size_t cap)
         first = false;
     }
     closedir(dir);
+    sd_unlock();
     w = snprintf(buf + n, cap - (size_t)n, "]");
     if (w > 0 && (size_t)(n + w) < cap) {
         n += w;
@@ -194,16 +268,24 @@ FILE *sd_log_open_read(const char *name, uint32_t *size_out)
     if (!sd_mounted || !name_is_log_bin(name)) {
         return NULL;
     }
-    sd_log_flush();
+    sd_lock();
+    if (log_file != NULL) {
+        fflush(log_file);
+        fsync(fileno(log_file));
+        sync_counter = 0;
+    }
     char full[40];
     if (snprintf(full, sizeof(full), MOUNT_POINT "/%s", name) >= (int)sizeof(full)) {
+        sd_unlock();
         return NULL;
     }
     struct stat st;
     if (stat(full, &st) != 0 || st.st_size < 0) {
+        sd_unlock();
         return NULL;
     }
     FILE *f = fopen(full, "rb");
+    sd_unlock();
     if (f == NULL) {
         return NULL;
     }
@@ -213,11 +295,95 @@ FILE *sd_log_open_read(const char *name, uint32_t *size_out)
     return f;
 }
 
+bool sd_log_erase(const char *name)
+{
+    if (!sd_mounted || !name_is_log_bin(name)) {
+        return false;
+    }
+    char full[40];
+    if (snprintf(full, sizeof(full), MOUNT_POINT "/%s", name) >= (int)sizeof(full)) {
+        return false;
+    }
+
+    sd_lock();
+    bool was_active = (log_file != NULL && strcasecmp(path_basename(log_path), name) == 0);
+    if (was_active) {
+        close_active_unlocked();
+        log_path[0] = '\0';
+    }
+    int rc = unlink(full);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "erase %s fail errno=%d %s", name, errno, strerror(errno));
+        if (was_active) {
+            open_boot_log_file();
+            sd_ready = (log_file != NULL);
+        }
+        sd_unlock();
+        return false;
+    }
+    ESP_LOGI(TAG, "erased %s%s", name, was_active ? " (era ativo)" : "");
+    if (was_active) {
+        open_boot_log_file();
+        sd_ready = (log_file != NULL);
+    }
+    sd_unlock();
+    return true;
+}
+
+int sd_log_erase_all(void)
+{
+    if (!sd_mounted) {
+        return -1;
+    }
+
+    sd_lock();
+    close_active_unlocked();
+    log_path[0] = '\0';
+
+    DIR *dir = opendir(MOUNT_POINT);
+    if (dir == NULL) {
+        open_boot_log_file();
+        sd_ready = (log_file != NULL);
+        sd_unlock();
+        return -1;
+    }
+
+    int n_del = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (!name_is_log_bin(ent->d_name)) {
+            continue;
+        }
+        char full[40];
+        if (snprintf(full, sizeof(full), MOUNT_POINT "/%s", ent->d_name) >= (int)sizeof(full)) {
+            continue;
+        }
+        if (unlink(full) == 0) {
+            n_del++;
+            ESP_LOGI(TAG, "erased %s", ent->d_name);
+        } else {
+            ESP_LOGW(TAG, "erase %s fail errno=%d", ent->d_name, errno);
+        }
+        /* Yield mantendo o mutex: WiFi/httpd seguem; evita corrida FATFS. */
+        vTaskDelay(1);
+    }
+    closedir(dir);
+
+    open_boot_log_file();
+    sd_ready = (log_file != NULL);
+    sd_unlock();
+    ESP_LOGI(TAG, "erase_all removed %d file(s)", n_del);
+    return n_del;
+}
+
 void sd_log_init(void)
 {
     sd_ready = false;
     sd_mounted = false;
     log_path[0] = '\0';
+    if (s_mtx == NULL) {
+        s_mtx = xSemaphoreCreateMutex();
+    }
     ESP_LOGI(TAG, "SD SPI CS=%d MOSI=%d CLK=%d MISO=%d",
              (int)PIN_SD_CS, (int)PIN_SD_MOSI, (int)PIN_SD_CLK, (int)PIN_SD_MISO);
 
@@ -234,7 +400,7 @@ void sd_log_init(void)
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
-        .max_files = 5,
+        .max_files = 8,
         .allocation_unit_size = 16 * 1024
     };
 
@@ -280,7 +446,12 @@ void sd_log_init(void)
 
 void sd_log_data(SD_Storage_Packet *pkt)
 {
-    if (log_file == NULL || pkt == NULL) {
+    if (pkt == NULL || s_busy) {
+        return; /* box/download: SPI exclusivo para SoftAP */
+    }
+    sd_lock();
+    if (log_file == NULL || s_busy) {
+        sd_unlock();
         return;
     }
     fwrite(pkt, sizeof(SD_Storage_Packet), 1, log_file);
@@ -290,4 +461,5 @@ void sd_log_data(SD_Storage_Packet *pkt)
         fsync(fileno(log_file));
         sync_counter = 0;
     }
+    sd_unlock();
 }
