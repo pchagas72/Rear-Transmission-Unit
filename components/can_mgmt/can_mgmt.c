@@ -374,7 +374,10 @@ void can_refresh_link_status(car_state_t *state, uint32_t now)
         state->speed = 0;
     }
     if (!state->rcu_mlx_ok) {
-        state->cvt_temp = 0;
+        /* -1 = SNA (MLX desconectado / timeout) — SoftAP/pit mostram "SNA". */
+        state->cvt_temp = -1;
+    } else if (state->cvt_temp < 0) {
+        state->cvt_temp = -1;
     }
     if ((state->last_rpm_ms == 0) || ((now - state->last_rpm_ms) > SENSOR_ALIVE_MS)) {
         state->rpm = 0;
@@ -482,20 +485,29 @@ bool can_update_state(car_state_t *state)
             state->last_rcu_ms = t;
             state->last_speed_ms = t;
             break;
-        case CAN_CVT_TEMP_ID:
-            state->cvt_temp = le_i16(msg.data);
+        case CAN_CVT_TEMP_ID: {
+            /* °C×100. RCU manda -1 se MLX falhou (desconectado). */
+            int16_t cvt = le_i16(msg.data);
             state->last_rcu_ms = t;
-            state->last_cvt_ms = t;
+            if (cvt < 0) {
+                state->cvt_temp = -1; /* SNA */
+                state->last_cvt_ms = 0; /* força FLAG_RCU_MLX_OK off */
+            } else {
+                state->cvt_temp = cvt;
+                state->last_cvt_ms = t;
+            }
             break;
+        }
         case CAN_ENG_TEMP_ID: {
-            /* °C×100. NTC aberto → ADC alto → calc. negativo/absurdo. */
+            /* °C×100. NTC aberto → ADC alto → calc. negativo/absurdo ou -1. */
             int16_t eng = le_i16(msg.data);
             state->last_rcu_ms = t;
-            state->last_eng_ms = t;
             if (eng < 0 || eng > 18000) {
                 state->eng_temp = -1; /* SNA */
+                state->last_eng_ms = 0;
             } else {
                 state->eng_temp = eng;
+                state->last_eng_ms = t;
             }
             break;
         }
