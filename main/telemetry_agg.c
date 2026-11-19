@@ -1,7 +1,10 @@
 #include "telemetry_agg.h"
 #include "can_mgmt.h"
 #include "rtu_diag.h"
+#include <assert.h>
 #include <string.h>
+
+static_assert(sizeof(telemetry_packet_t) == 52, "pacote LoRa travado em 52 bytes");
 
 static uint16_t pack_status_flags(const car_state_t *s, bool led_debug)
 {
@@ -45,6 +48,11 @@ static uint16_t pack_status_flags(const car_state_t *s, bool led_debug)
 
 void telemetry_fill(telemetry_packet_t *pkt, const car_state_t *car, bool led_debug)
 {
+    assert(pkt != NULL);
+    assert(car != NULL);
+    if (pkt == NULL || car == NULL) {
+        return;
+    }
     const bool fcu_down = rtu_diag_fcu_down_confirmed();
     const bool rcu_down = rtu_diag_rcu_down_confirmed();
     memset(pkt, 0, sizeof(*pkt));

@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -6,6 +7,7 @@
 #include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
@@ -29,6 +31,7 @@
 #include "rtu_diag.h"
 #include "rtu_health.h"
 #include "rtu_fw.h"
+#include "lora_rate.h"
 
 static const char *TAG = "RTU";
 
@@ -39,7 +42,12 @@ static rtu_runtime_t rt;
 
 static void queue_command_ack_ex(uint16_t flag, uint8_t soc)
 {
-    xSemaphoreTake(q.ack_mutex, portMAX_DELAY);
+    if (q.ack_mutex == NULL || q.tx_trigger == NULL) {
+        return;
+    }
+    if (xSemaphoreTake(q.ack_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
     rt.pending_ack_flags |= flag;
     if (soc != 0) {
         rt.pending_soc_ack = soc;
@@ -47,8 +55,15 @@ static void queue_command_ack_ex(uint16_t flag, uint8_t soc)
     /* Box (soc): mais janelas — estação precisa ouvir 0xBB no ar. */
     const uint8_t ttl = (soc == TELEM_SOC_ACK_BOX) ? 16u : 10u;
     rt.pending_ack_ttl = ttl;
-    xSemaphoreGive(q.ack_mutex);
-    xSemaphoreGive(q.tx_trigger); /* acorda lora_tx já — prioridade ACK */
+    BaseType_t gave = xSemaphoreGive(q.ack_mutex);
+    assert(gave == pdTRUE);
+    if (gave != pdTRUE) {
+        return;
+    }
+    /* pdFALSE = task de TX já acordada (semáforo já disponível). */
+    BaseType_t kicked = xSemaphoreGive(q.tx_trigger);
+    assert(kicked == pdTRUE || kicked == pdFALSE);
+    (void)kicked;
     if (soc == TELEM_SOC_ACK_BOX) {
         ESP_LOGI(TAG, "ACK BOX queued (soc=0x%02X ttl=%u)", (unsigned)soc,
                  (unsigned)ttl);
@@ -141,23 +156,28 @@ static void can_svc_task(void *arg)
     }
 }
 
-#define LORA_TX_PERIOD_MS     1000  /* telem normal 1 Hz */
-#define LORA_ACK_BURST_MS      200  /* ACK: re-TX rápido (ok “perder” telem no ar) */
+#define LORA_ACK_BURST_MS 200  /* ACK: re-TX rápido (ok “perder” telem no ar) */
 
 static void lora_tx_task(void *arg)
 {
     (void)arg;
     telemetry_packet_t tx_copy;
-    ESP_LOGI(TAG, "lora_tx on core %d period=%dms ack_burst=%dms",
-             xPortGetCoreID(), LORA_TX_PERIOD_MS, LORA_ACK_BURST_MS);
+    uint32_t logged_ms = 0;
+    ESP_LOGI(TAG, "lora_tx on core %d rate=%lums ack_burst=%dms",
+             xPortGetCoreID(), (unsigned long)lora_rate_ms(), LORA_ACK_BURST_MS);
 
     while (1) {
-        /* Cadência: 1 Hz normal; com ACK pendente, burst ~200 ms. */
+        /* Cadência: lora_rate (NVS/UI); com ACK pendente, burst ~200 ms. */
         xSemaphoreTake(q.ack_mutex, portMAX_DELAY);
         const bool ack_wait = (rt.pending_ack_ttl > 0);
         xSemaphoreGive(q.ack_mutex);
+        const uint32_t period_ms = lora_rate_ms();
+        if (period_ms != logged_ms) {
+            ESP_LOGI(TAG, "lora_tx period=%lums", (unsigned long)period_ms);
+            logged_ms = period_ms;
+        }
         (void)xSemaphoreTake(q.tx_trigger,
-                             pdMS_TO_TICKS(ack_wait ? LORA_ACK_BURST_MS : LORA_TX_PERIOD_MS));
+                             pdMS_TO_TICKS(ack_wait ? LORA_ACK_BURST_MS : period_ms));
 
         if (!fsm_is_running() && fsm_state() != FSM_SELF_CHECK) {
             continue;
@@ -183,7 +203,10 @@ static void lora_tx_task(void *arg)
         for (int i = 0; i < quiet_loops; i++) {
             TickType_t quiet = xTaskGetTickCount() - rt.e32_last_rx_tick;
             size_t pending_rx = 0;
-            (void)uart_get_buffered_data_len(E32_UART_NUM, &pending_rx);
+            esp_err_t err = uart_get_buffered_data_len(E32_UART_NUM, &pending_rx);
+            if (err != ESP_OK) {
+                break;
+            }
             if (pending_rx == 0 && quiet >= pdMS_TO_TICKS(quiet_need)) {
                 break;
             }
@@ -207,6 +230,7 @@ static void lora_tx_task(void *arg)
 
         if (e32_send_struct(&tx_copy, sizeof(tx_copy))) {
             rtu_health_note_lora(true);
+            lora_rate_note_tx();
             /* SoftAP/Diag vê o mesmo snapshot que foi ao ar (incl. soc ACK box). */
             telem_store_update(&tx_copy);
             static uint32_t tx_ok;
@@ -442,8 +466,10 @@ void app_main(void)
 
     if (wifi_ap_start() != ESP_OK) {
         ESP_LOGE(TAG, "WiFi SoftAP falhou");
+        lora_rate_init(); /* default 1 Hz se NVS não subiu */
     } else {
         rtu_health_init(); /* NVS boot/reset após nvs_flash do SoftAP */
+        lora_rate_init();  /* cadência LoRa em NVS */
         if (http_telem_start(http_ascii_cmd) != ESP_OK) {
             ESP_LOGE(TAG, "HTTP UI falhou");
         }
@@ -458,6 +484,7 @@ void app_main(void)
     q.sd = xQueueCreate(SD_QUEUE_SIZE, sizeof(SD_Storage_Packet));
     q.tx_trigger = xSemaphoreCreateBinary();
     q.ack_mutex = xSemaphoreCreateMutex();
+    lora_rate_bind_kick(q.tx_trigger);
 
     if (q.telemetry == NULL || q.sd == NULL || q.tx_trigger == NULL || q.ack_mutex == NULL) {
         ESP_LOGE(TAG, "queue/mutex alloc failed — restart");

@@ -14,6 +14,7 @@
 #include "rtu_diag.h"
 #include "rtu_health.h"
 #include "rtu_fw.h"
+#include "lora_rate.h"
 #include "system_fsm.h"
 #include "sd_log.h"
 
@@ -64,6 +65,8 @@ static const char INDEX_HTML[] =
 "font-size:.7rem;font-weight:600}.chip.on{border-color:var(--ok);color:var(--ok)}"
 ".chip.off{border-color:var(--bad);color:var(--bad)}.chip.warn{border-color:var(--warn);color:var(--warn)}"
 ".chip.neu{color:var(--mut)}"
+".chip.btn{cursor:pointer;font:600 .72rem inherit;color:var(--fg)}"
+".chip.btn.on{border-color:var(--acc);color:var(--acc);background:#123044}"
 ".meta{font-size:.75rem;color:var(--mut);font-variant-numeric:tabular-nums}"
 "table{width:100%;border-collapse:collapse;font-size:.75rem;font-variant-numeric:tabular-nums}"
 "th,td{text-align:left;padding:.35rem .4rem;border-bottom:1px solid var(--line)}"
@@ -128,6 +131,9 @@ static const char INDEX_HTML[] =
 "<div class=n style=font-size:1rem id=gps>—</div></div>"
 "<div class=sec>Links</div><div class=chips id=lnk></div>"
 "<div class=sec>CAN</div><div class=g><div class=meta id=can>—</div></div>"
+"<div class=sec>LoRa · pacotes no ar</div>"
+"<div class=chips id=lora></div>"
+"<div class=g><div class=meta id=loraMeta>…</div></div>"
 "</section>"
 "<section class=view id=vDiag>"
 "<div class=sec>API token</div>"
@@ -190,7 +196,35 @@ static const char INDEX_HTML[] =
 "const FS={0:'BOOT',1:'SELF',2:'RUN',3:'ERR',4:'DOWN'};"
 "const F_LED=1<<15;"
 "const TK='rtu_api_token';"
-"let page='dat';"
+"let page='dat',loraMs=0,loraGap=0,loraOpts=[500,1000,2000,5000,10000];"
+"function hzOf(ms){const hz=1000/ms;return (hz>=1?(hz%1?hz.toFixed(1):String(hz|0)):hz.toFixed(2))+' Hz'}"
+"function paintLora(){"
+" if(!$('loraMeta')||!loraMs)return;"
+" const gap=loraGap?(' · último intervalo '+loraGap+' ms'):' · aguardando primeiro TX';"
+" $('loraMeta').textContent='enviado a cada '+loraMs+' ms ('+hzOf(loraMs)+')'+gap;"
+"}"
+"function renderLora(){"
+" const box=$('lora'); if(!box||!loraMs)return;"
+" const key=String(loraMs)+':'+loraOpts.join(',');"
+" if(box.dataset.cur!==key){"
+"  box.dataset.cur=key;"
+"  box.innerHTML=loraOpts.map(ms=>'<button type=button class=\"chip btn'+(ms===loraMs?' on':'')+'\" data-lora='+ms+'>'+ms+' ms</button>').join('');"
+"  box.querySelectorAll('[data-lora]').forEach(b=>b.onclick=async()=>{"
+"   const want=+b.dataset.lora;"
+"   const r=await fetch('/api/lora',{method:'POST',headers:{'Content-Type':'text/plain'},body:String(want)});"
+"   let j=null; try{j=await r.json()}catch(e){}"
+"   if(j&&j.ok){loraMs=j.ms;loraGap=j.gap_ms||loraGap;if(j.opts&&j.opts.length)loraOpts=j.opts;box.dataset.cur='';renderLora();}"
+"   else{$('loraMeta').textContent='período recusado';}"
+"  });"
+" }"
+" paintLora();"
+"}"
+"async function loadLora(){"
+" try{const r=await fetch('/api/lora',{cache:'no-store'});if(!r.ok)return;const j=await r.json();"
+"  loraMs=j.ms;loraGap=j.gap_ms||0;if(j.opts&&j.opts.length)loraOpts=j.opts;"
+"  const box=$('lora');if(box)box.dataset.cur='';renderLora();"
+" }catch(e){}"
+"}"
 "function getTok(){return localStorage.getItem(TK)||'';}"
 "function setTok(v){localStorage.setItem(TK,v||'');$('tok').value=v||'';}"
 "$('tok').value=getTok()||'manguebaja';"
@@ -312,8 +346,10 @@ static const char INDEX_HTML[] =
 "    +chip('SD',h.sd_busy?'warn':(h.sd?'on':'off'))+chip('E32',h.e32_aux?'on':'off')"
 "    +chip('LoRa '+h.lora_ok+'/'+h.lora_fail,h.lora_fail>0&&h.lora_ok===0?'off':'on')"
 "    +(h.sd_busy?chip('BOX/SD','warn'):'');"
+"   if(h.lora_ms){loraGap=+h.lora_gap_ms||0;if(loraMs!==h.lora_ms)loraMs=h.lora_ms;renderLora();}"
 "   $('dHealth').textContent='up '+(h.uptime_ms/1000).toFixed(0)+'s · heap '+fmtB(h.heap)"
 "    +' (min '+fmtB(h.heap_min)+') · can_rx '+h.can_rx"
+"    +(h.lora_ms?(' · LoRa '+h.lora_ms+' ms'+(h.lora_gap_ms?(' gap '+h.lora_gap_ms):'')):'')"
 "    +(h.sd_path?' · '+h.sd_path:'');"
 "  }"
 "  if(d){"
@@ -342,7 +378,7 @@ static const char INDEX_HTML[] =
 "  }"
 " }catch(e){$('st').textContent='ERRO';$('st').style.color='var(--bad)';$('dot').className='dot'}"
 "}"
-"setInterval(tick,500);tick();loadSd();loadCfg();setInterval(loadSd,5000);"
+"setInterval(tick,500);tick();loadSd();loadCfg();loadLora();setInterval(loadSd,5000);"
 "document.querySelectorAll('[data-c]').forEach(b=>b.onclick=async()=>{"
 " const r=await fetch('/api/cmd',{method:'POST',headers:Object.assign({'Content-Type':'text/plain'},authH()),"
 "  body:b.dataset.c});"
@@ -423,7 +459,7 @@ static esp_err_t send_diag(httpd_req_t *req)
 
 static esp_err_t send_health(httpd_req_t *req)
 {
-    char buf[512];
+    char buf[640];
     int n = rtu_health_json(buf, sizeof(buf));
     if (n <= 0) {
         httpd_resp_set_status(req, "500 Internal Server Error");
@@ -433,6 +469,63 @@ static esp_err_t send_health(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, buf, n);
+}
+
+static esp_err_t send_lora(httpd_req_t *req)
+{
+    char buf[160];
+    int n = lora_rate_json(buf, sizeof(buf));
+    if (n <= 0) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_send(req, "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, buf, n);
+}
+
+static esp_err_t post_lora(httpd_req_t *req)
+{
+    char body[32];
+    int total = req->content_len;
+    if (total <= 0 || total >= (int)sizeof(body)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+    }
+    int n = httpd_req_recv(req, body, total);
+    if (n <= 0) {
+        return ESP_FAIL;
+    }
+    body[n] = '\0';
+    uint32_t ms = 0;
+    bool digits = false;
+    for (int i = 0; i < n; i++) {
+        char c = body[i];
+        if (c == ' ' || c == '\r' || c == '\n') {
+            continue;
+        }
+        if (c < '0' || c > '9' || ms > 100000u) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            return httpd_resp_send(req, "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+        }
+        digits = true;
+        ms = ms * 10u + (uint32_t)(c - '0');
+    }
+    bool ok = digits && lora_rate_set_ms(ms);
+    char state[160];
+    int sn = lora_rate_json(state, sizeof(state));
+    char resp[200];
+    if (!ok || sn <= 2 || state[0] != '{') {
+        httpd_resp_set_status(req, "400 Bad Request");
+        snprintf(resp, sizeof(resp), "{\"ok\":false}");
+    } else {
+        /* state é {"ms":...} — prefixa ok sem aninhar objeto. */
+        snprintf(resp, sizeof(resp), "{\"ok\":true,%s", state + 1);
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t send_sd_list(httpd_req_t *req)
@@ -789,6 +882,9 @@ esp_err_t http_telem_start(http_cmd_fn cmd_cb)
         { .uri = "/api/json",       .method = HTTP_GET,     .handler = send_json },
         { .uri = "/api/diag",       .method = HTTP_GET,     .handler = send_diag },
         { .uri = "/api/health",     .method = HTTP_GET,     .handler = send_health },
+        { .uri = "/api/lora",       .method = HTTP_GET,     .handler = send_lora },
+        { .uri = "/api/lora",       .method = HTTP_POST,    .handler = post_lora },
+        { .uri = "/api/lora",       .method = HTTP_OPTIONS, .handler = options_cors },
         { .uri = "/api/cfg",        .method = HTTP_GET,     .handler = send_cfg },
         { .uri = "/api/cfg",        .method = HTTP_POST,    .handler = post_cfg },
         { .uri = "/api/cfg",        .method = HTTP_OPTIONS, .handler = options_cors },
@@ -805,6 +901,6 @@ esp_err_t http_telem_start(http_cmd_fn cmd_cb)
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(s_server, &uris[i]);
     }
-    ESP_LOGI(TAG, "UI http://192.168.4.1/  auth on cmd/sd/cfg/erase");
+    ESP_LOGI(TAG, "UI http://192.168.4.1/  /api/lora + auth on cmd/sd/cfg/erase");
     return ESP_OK;
 }
