@@ -211,7 +211,7 @@ static const char INDEX_HTML[] =
 "  box.innerHTML=loraOpts.map(ms=>'<button type=button class=\"chip btn'+(ms===loraMs?' on':'')+'\" data-lora='+ms+'>'+ms+' ms</button>').join('');"
 "  box.querySelectorAll('[data-lora]').forEach(b=>b.onclick=async()=>{"
 "   const want=+b.dataset.lora;"
-"   const r=await fetch('/api/lora',{method:'POST',headers:{'Content-Type':'text/plain'},body:String(want)});"
+"   const r=await fetch('/api/lora',{method:'POST',headers:Object.assign({'Content-Type':'text/plain'},authH()),body:String(want)});"
 "   let j=null; try{j=await r.json()}catch(e){}"
 "   if(j&&j.ok){loraMs=j.ms;loraGap=j.gap_ms||loraGap;if(j.opts&&j.opts.length)loraOpts=j.opts;box.dataset.cur='';renderLora();}"
 "   else{$('loraMeta').textContent='período recusado';}"
@@ -457,6 +457,8 @@ static esp_err_t send_diag(httpd_req_t *req)
     return httpd_resp_send(req, buf, n);
 }
 
+static esp_err_t require_token(httpd_req_t *req);
+
 static esp_err_t send_health(httpd_req_t *req)
 {
     char buf[640];
@@ -487,6 +489,11 @@ static esp_err_t send_lora(httpd_req_t *req)
 
 static esp_err_t post_lora(httpd_req_t *req)
 {
+    esp_err_t auth = require_token(req);
+    if (auth != ESP_OK) {
+        return auth;
+    }
+
     char body[32];
     int total = req->content_len;
     if (total <= 0 || total >= (int)sizeof(body)) {
@@ -901,6 +908,6 @@ esp_err_t http_telem_start(http_cmd_fn cmd_cb)
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(s_server, &uris[i]);
     }
-    ESP_LOGI(TAG, "UI http://192.168.4.1/  /api/lora + auth on cmd/sd/cfg/erase");
+    ESP_LOGI(TAG, "UI http://192.168.4.1/  auth on cmd/sd/cfg/erase/lora");
     return ESP_OK;
 }
